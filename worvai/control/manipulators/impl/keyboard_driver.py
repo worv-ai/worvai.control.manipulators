@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 import carb
@@ -151,7 +151,7 @@ class ManipulatorKeyboardDriver:
         key_input = event.input
         state = self._key_states.get(key_input)
         if state is None:
-            return True
+            return False  # Not our key — allow propagation to other handlers
 
         if event.type in (carb.input.KeyboardEventType.KEY_PRESS, carb.input.KeyboardEventType.KEY_REPEAT):
             state.pressed = True

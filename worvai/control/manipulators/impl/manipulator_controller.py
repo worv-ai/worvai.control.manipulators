@@ -213,6 +213,12 @@ class ManipulatorKeyboardController:
     def step(self) -> None:
         """
         Execute one control step. Call from a physics callback each simulation frame.
+
+        Order of operations:
+            1. Collision safety check (using previous frame sensor data)
+            2. If blocked, skip all new commands this frame
+            3. Snapshot safe state
+            4. Apply new EE target, RMPflow, wrist overrides, gripper
         """
         if not self._initialized or self._robot is None:
             return
@@ -221,29 +227,27 @@ class ManipulatorKeyboardController:
             return
 
         self._frame_counter += 1
-
-        # Snapshot safe state before applying new commands
-        self._safe_ee_target[:] = self._ee_target
-        self._safe_wrist[:] = self._desired_wrist
-
-        # Detect whether the user is actively commanding motion
         self._is_commanding_motion = self._any_motion_key_pressed()
 
-        # Apply keyboard-driven EE target update
-        self._ee_target.flags.writeable = True
-        self._update_ee_target_from_keyboard()
-        clamped_target = self._clamp_target_to_reach(self._ee_target)
-        self._apply_rmpflow(clamped_target)
-
-        # Collision safety check — only every N frames to reduce overhead
+        # Collision safety check FIRST — uses previous frame's sensor data
         if self._is_commanding_motion and self._frame_counter % _SAFETY_CHECK_INTERVAL == 0:
             if self._check_collision_safety():
                 self._revert_to_safe_state()
+                return  # Skip all new commands while blocked
         elif not self._is_commanding_motion:
             self._stall_frame_count = 0
             if self._is_blocked:
                 self._is_blocked = False
 
+        # Snapshot safe state before applying new commands
+        self._safe_ee_target[:] = self._ee_target
+        self._safe_wrist[:] = self._desired_wrist
+
+        # Apply new commands
+        self._ee_target.flags.writeable = True
+        self._update_ee_target_from_keyboard()
+        clamped_target = self._clamp_target_to_reach(self._ee_target)
+        self._apply_rmpflow(clamped_target)
         self._apply_wrist_overrides()
         self._apply_gripper()
 
@@ -294,9 +298,11 @@ class ManipulatorKeyboardController:
         try:
             measured_efforts = self._robot.get_measured_joint_efforts(joint_indices=self._arm_indices)
             self._max_measured_effort = float(np.max(np.abs(measured_efforts)))
-        except Exception:
+        except Exception as exc:
+            carb.log_warn(f"[ManipulatorKeyboardController] Effort read failed: {exc}. Halting as precaution.")
             self._max_measured_effort = 0.0
-            return False
+            self._is_blocked = True
+            return True  # Fail-safe: treat unknown sensor state as unsafe
 
         # Effort spike -- the arm is fighting a collision or singularity
         if self._max_measured_effort > self._config.effort_spike_threshold:
@@ -313,8 +319,9 @@ class ManipulatorKeyboardController:
         try:
             joint_velocities = self._robot.get_joint_velocities(joint_indices=self._arm_indices)
             max_velocity = float(np.max(np.abs(joint_velocities)))
-        except Exception:
-            max_velocity = 1.0
+        except Exception as exc:
+            carb.log_warn(f"[ManipulatorKeyboardController] Velocity read failed: {exc}. Assuming stall.")
+            max_velocity = 0.0  # Fail-safe: treat unknown as stalled
 
         if max_velocity < self._config.velocity_stall_threshold:
             self._stall_frame_count += 1
@@ -374,7 +381,7 @@ class ManipulatorKeyboardController:
     def _init_robot_state(self) -> None:
         p = self._profile
         base_pos, base_rot = self._robot.get_world_pose()
-        self._robot_base_position = np.array(base_pos, dtype=np.float64)
+        self._robot_base_position[:] = base_pos  # in-place to preserve array identity
 
         self._controller.get_motion_policy().set_robot_base_pose(base_pos, base_rot)
 
@@ -383,13 +390,13 @@ class ManipulatorKeyboardController:
         joint_positions = self._robot.get_joint_positions()
         active_joints = joint_positions[:p.arm_dof_count]
         ee_pos, _ = self._rmpflow.get_end_effector_pose(active_joints)
-        self._ee_target = np.array(ee_pos, dtype=np.float64)
+        self._ee_target[:] = ee_pos  # in-place to preserve array identity
 
         wi = p.wrist_joint_indices
         self._desired_wrist[0] = float(joint_positions[wi[0]])
         self._desired_wrist[1] = float(joint_positions[wi[1]])
 
-        self._safe_ee_target = self._ee_target.copy()
+        self._safe_ee_target[:] = self._ee_target
         self._safe_wrist[:] = self._desired_wrist
 
     def _resolve_finger_joint_indices(self) -> None:
@@ -443,6 +450,8 @@ class ManipulatorKeyboardController:
     def _clamp_target_to_reach(self, target: np.ndarray) -> np.ndarray:
         offset = target - self._robot_base_position
         distance = np.linalg.norm(offset)
+        if distance < 1e-9:
+            return target  # Target at robot base — no direction to clamp along
         if distance > self._max_clamped_reach:
             return self._robot_base_position + (offset / distance) * self._max_clamped_reach
         return target
