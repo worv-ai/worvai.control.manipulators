@@ -15,7 +15,7 @@ EXTENSION_TITLE = "Manipulator Control"
 
 class ManipulatorControlExtension(omni.ext.IExt):
     """
-    Extension for keyboard-driven Franka manipulator control with a dockable GUI panel.
+    Extension for keyboard-driven manipulator control with a dockable GUI panel.
 
     Accessible via Robot > Manipulator Control in the menu bar.
     """

@@ -8,10 +8,10 @@ import omni.timeline
 import omni.ui as ui
 from isaacsim.core.utils.stage import add_reference_to_stage
 
-from .franka_keyboard_controller import FrankaControlConfig, FrankaKeyboardController
+from .manipulator_controller import ManipulatorControlConfig, ManipulatorKeyboardController
 from .target_visualizer import TargetVisualizer
 
-_FRANKA_USD_URL = (
+_DEFAULT_ROBOT_USD_URL = (
     "https://omniverse-content-production.s3-us-west-2.amazonaws.com"
     "/Assets/Isaac/5.1/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
 )
@@ -23,20 +23,21 @@ _UI_UPDATE_INTERVAL = 10  # update status labels every N frames
 class ManipulatorUIBuilder:
     """
     Builds the Manipulator Control panel UI and manages the lifecycle of
-    ``FrankaKeyboardController`` and ``TargetVisualizer``.
+    ``ManipulatorKeyboardController`` and ``TargetVisualizer``.
 
     Uses a single update-stream subscription for both physics stepping and UI updates
     to minimise per-frame overhead.
     """
 
     def __init__(self) -> None:
-        self._controller: Optional[FrankaKeyboardController] = None
+        self._controller: Optional[ManipulatorKeyboardController] = None
         self._visualizer: Optional[TargetVisualizer] = None
         self._update_sub = None
         self._timeline_sub = None
         self._frame_counter: int = 0
 
         # UI models
+        self._usd_url_model = ui.SimpleStringModel(_DEFAULT_ROBOT_USD_URL)
         self._prim_path_model = ui.SimpleStringModel(_DEFAULT_ROBOT_PRIM_PATH)
         self._ee_speed_model = ui.SimpleFloatModel(0.0005)
         self._wrist_speed_model = ui.SimpleFloatModel(0.01)
@@ -68,10 +69,13 @@ class ManipulatorUIBuilder:
     def _build_robot_setup_frame(self) -> None:
         with ui.VStack(spacing=4):
             with ui.HStack(height=22):
+                ui.Label("Robot USD URL", width=_LABEL_WIDTH)
+                ui.StringField(model=self._usd_url_model)
+            with ui.HStack(height=22):
                 ui.Label("Robot Prim Path", width=_LABEL_WIDTH)
                 ui.StringField(model=self._prim_path_model)
             with ui.HStack(spacing=6, height=28):
-                ui.Button("Load Franka", clicked_fn=self._on_load_franka, height=26)
+                ui.Button("Load Robot", clicked_fn=self._on_load_robot, height=26)
                 ui.Button("Start Control", clicked_fn=self._on_start_control, height=26)
                 ui.Button("Stop Control", clicked_fn=self._on_stop_control, height=26)
 
@@ -141,17 +145,21 @@ class ManipulatorUIBuilder:
     # Button callbacks
     # ------------------------------------------------------------------
 
-    def _on_load_franka(self) -> None:
+    def _on_load_robot(self) -> None:
         prim_path = self._prim_path_model.get_value_as_string().strip()
         if not prim_path:
             prim_path = _DEFAULT_ROBOT_PRIM_PATH
             self._prim_path_model.set_value(prim_path)
+        usd_url = self._usd_url_model.get_value_as_string().strip()
+        if not usd_url:
+            usd_url = _DEFAULT_ROBOT_USD_URL
+            self._usd_url_model.set_value(usd_url)
         try:
-            add_reference_to_stage(usd_path=_FRANKA_USD_URL, prim_path=prim_path)
-            self._set_status("Franka loaded", ok=True)
+            add_reference_to_stage(usd_path=usd_url, prim_path=prim_path)
+            self._set_status("Robot loaded", ok=True)
         except Exception as exc:
             self._set_status(f"Load failed: {exc}", ok=False)
-            carb.log_error(f"[ManipulatorUI] Failed to load Franka: {exc}")
+            carb.log_error(f"[ManipulatorUI] Failed to load robot: {exc}")
 
     def _on_start_control(self) -> None:
         if self._controller is not None and self._controller.is_initialized:
@@ -163,13 +171,13 @@ class ManipulatorUIBuilder:
             self._set_status("Set prim path first", ok=False)
             return
 
-        config = FrankaControlConfig(
+        config = ManipulatorControlConfig(
             ee_step_size_m=self._ee_speed_model.get_value_as_float(),
             wrist_joint_speed_rad=self._wrist_speed_model.get_value_as_float(),
             gripper_speed=self._gripper_speed_model.get_value_as_float(),
             effort_spike_threshold=self._effort_threshold_model.get_value_as_float(),
         )
-        self._controller = FrankaKeyboardController(robot_prim_path=prim_path, config=config)
+        self._controller = ManipulatorKeyboardController(robot_prim_path=prim_path, config=config)
 
         timeline = omni.timeline.get_timeline_interface()
         self._timeline_sub = timeline.get_timeline_event_stream().create_subscription_to_pop(

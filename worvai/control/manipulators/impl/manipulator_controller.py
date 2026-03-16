@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 import carb
 import numpy as np
@@ -11,42 +11,50 @@ import isaacsim.robot_motion.motion_generation as mg
 
 from .keyboard_driver import ManipulatorKeyBindings, ManipulatorKeyboardDriver
 
-# Franka Panda physical constants (metres, radians)
-_FRANKA_MAX_REACH_M = 0.855
-_REACH_SAFETY_FACTOR = 0.95
-_MAX_CLAMPED_REACH = _FRANKA_MAX_REACH_M * _REACH_SAFETY_FACTOR
-
-# Joint limits from the Franka URDF (joints 6 and 7, zero-indexed as 5 and 6 in the DOF array)
-_JOINT6_LOWER = -0.0175
-_JOINT6_UPPER = 3.7525
-_JOINT7_LOWER = -2.8973
-_JOINT7_UPPER = 2.8973
-
-# Franka finger joint names and limits
-_FINGER_JOINT_NAMES = ("panda_finger_joint1", "panda_finger_joint2")
-_FINGER_OPEN_POSITION = 0.04   # metres
-_FINGER_CLOSED_POSITION = 0.0  # metres
-
-# Arm DOF count (joints 0-6, excluding fingers)
-_ARM_DOF_COUNT = 7
-
-# Pre-allocated index arrays (module-level to avoid per-frame allocation)
-_ARM_INDICES = np.arange(_ARM_DOF_COUNT, dtype=np.int32)
-_WRIST_INDICES = np.array([5, 6], dtype=np.int32)
-
 # Collision detection defaults
 _EFFORT_SPIKE_THRESHOLD = 50.0
 _VELOCITY_STALL_THRESHOLD = 0.005
 _STALL_FRAMES_BEFORE_BLOCKED = 10
-
-# Safety check frequency — only run collision checks every N frames to reduce overhead
 _SAFETY_CHECK_INTERVAL = 3
+_REACH_SAFETY_FACTOR = 0.95
+
+
+@dataclass(frozen=True)
+class RobotProfile:
+    """
+    Describes the kinematic structure of a specific manipulator robot.
+
+    All joint indices are zero-based DOF indices as reported by
+    ``SingleArticulation.dof_names``.
+    """
+
+    # Identity — passed to ``load_supported_motion_policy_config``
+    robot_name: str = "Franka"
+    policy_name: str = "RMPflow"
+
+    # Arm geometry
+    arm_dof_count: int = 7
+    max_reach_m: float = 0.855
+
+    # Wrist override joints — indices and limits (radians)
+    wrist_joint_indices: Tuple[int, int] = (5, 6)
+    wrist_joint_lower: Tuple[float, float] = (-0.0175, -2.8973)
+    wrist_joint_upper: Tuple[float, float] = (3.7525, 2.8973)
+
+    # Gripper finger joint names and positions (metres)
+    finger_joint_names: Tuple[str, ...] = ("panda_finger_joint1", "panda_finger_joint2")
+    finger_open_position: float = 0.04
+    finger_closed_position: float = 0.0
+
+
+# Convenience presets
+FRANKA_PROFILE = RobotProfile()
 
 
 @dataclass
-class FrankaControlConfig:
+class ManipulatorControlConfig:
     """
-    Tuneable parameters for the Franka keyboard controller.
+    Tuneable runtime parameters for the manipulator keyboard controller.
 
     All speeds are per-physics-step deltas.
     """
@@ -60,18 +68,25 @@ class FrankaControlConfig:
     stall_frames_before_blocked: int = _STALL_FRAMES_BEFORE_BLOCKED
 
 
-class FrankaKeyboardController:
+# Backwards-compatible alias
+FrankaControlConfig = ManipulatorControlConfig
+
+
+class ManipulatorKeyboardController:
     """
-    Keyboard-driven Franka Panda controller combining RMPflow end-effector tracking,
-    direct wrist joint overrides (joints 6 & 7), and parallel gripper toggle,
+    Keyboard-driven manipulator controller combining RMPflow end-effector tracking,
+    direct wrist joint overrides, and parallel gripper toggle,
     with collision-aware safety monitoring.
+
+    The robot-specific geometry (DOF count, joint limits, finger names, reach) is
+    defined by a ``RobotProfile``. The default profile targets the Franka Panda.
 
     Controls:
         W/A/S/D     -- move end-effector target in XY plane
         Q/E         -- move end-effector up/down (Z axis)
         Arrow keys  -- alternative forward/back/left/right
-        Z/X         -- rotate wrist joint 7 (panda_joint7)
-        C/V         -- twist forearm joint 6 (panda_joint6)
+        Z/X         -- rotate wrist joint (profile.wrist_joint_indices[1])
+        C/V         -- twist forearm joint (profile.wrist_joint_indices[0])
         K           -- toggle gripper open/close
 
     The controller must be stepped explicitly each physics frame via ``step()``.
@@ -80,15 +95,13 @@ class FrankaKeyboardController:
     def __init__(
         self,
         robot_prim_path: str,
-        config: Optional[FrankaControlConfig] = None,
+        config: Optional[ManipulatorControlConfig] = None,
+        profile: Optional[RobotProfile] = None,
         key_bindings: Optional[ManipulatorKeyBindings] = None,
-        robot_name: str = "Franka",
-        policy_name: str = "RMPflow",
     ) -> None:
         self._robot_prim_path = robot_prim_path
-        self._config = config or FrankaControlConfig()
-        self._robot_name = robot_name
-        self._policy_name = policy_name
+        self._config = config or ManipulatorControlConfig()
+        self._profile = profile or FRANKA_PROFILE
 
         self._robot: Optional[SingleArticulation] = None
         self._controller: Optional[mg.MotionPolicyController] = None
@@ -96,19 +109,22 @@ class FrankaKeyboardController:
 
         self._keyboard_driver = ManipulatorKeyboardDriver(key_bindings)
 
+        # Derived from profile — pre-allocated at init for zero per-frame alloc
+        self._arm_indices = np.arange(self._profile.arm_dof_count, dtype=np.int32)
+        self._wrist_indices = np.array(self._profile.wrist_joint_indices, dtype=np.int32)
+        self._max_clamped_reach = self._profile.max_reach_m * _REACH_SAFETY_FACTOR
+
         # Motion state
         self._ee_target = np.zeros(3, dtype=np.float64)
         self._safe_ee_target = np.zeros(3, dtype=np.float64)
         self._robot_base_position = np.zeros(3, dtype=np.float64)
-        self._desired_joint6: float = 0.0
-        self._desired_joint7: float = 0.0
-        self._safe_joint6: float = 0.0
-        self._safe_joint7: float = 0.0
+        self._desired_wrist = np.zeros(2, dtype=np.float64)  # [joint_a, joint_b]
+        self._safe_wrist = np.zeros(2, dtype=np.float64)
         self._gripper_open: bool = True
         self._gripper_at_target: bool = True
         self._finger_joint_indices: Optional[np.ndarray] = None
 
-        # Pre-allocated action buffers (avoid per-frame allocation)
+        # Pre-allocated action buffers
         self._wrist_positions_buf = np.zeros(2, dtype=np.float64)
         self._gripper_positions_buf = np.zeros(2, dtype=np.float64)
 
@@ -144,8 +160,12 @@ class FrankaKeyboardController:
         return self._gripper_open
 
     @property
-    def config(self) -> FrankaControlConfig:
+    def config(self) -> ManipulatorControlConfig:
         return self._config
+
+    @property
+    def profile(self) -> RobotProfile:
+        return self._profile
 
     @property
     def keyboard_driver(self) -> ManipulatorKeyboardDriver:
@@ -174,7 +194,7 @@ class FrankaKeyboardController:
             self._robot = SingleArticulation(self._robot_prim_path)
             self._robot.initialize()
         except Exception as exc:
-            carb.log_warn(f"[FrankaKeyboardController] Robot init deferred: {exc}")
+            carb.log_warn(f"[ManipulatorKeyboardController] Robot init deferred: {exc}")
             return False
 
         if not self._init_rmpflow():
@@ -185,8 +205,8 @@ class FrankaKeyboardController:
         self._keyboard_driver.connect()
         self._initialized = True
         carb.log_info(
-            f"[FrankaKeyboardController] Initialized for '{self._robot_name}' at {self._robot_prim_path}. "
-            "WASD/QE/Arrows=move, ZX=wrist, CV=forearm, K=gripper"
+            f"[ManipulatorKeyboardController] Initialized '{self._profile.robot_name}' "
+            f"at {self._robot_prim_path}. WASD/QE/Arrows=move, ZX=wrist, CV=forearm, K=gripper"
         )
         return True
 
@@ -204,8 +224,7 @@ class FrankaKeyboardController:
 
         # Snapshot safe state before applying new commands
         self._safe_ee_target[:] = self._ee_target
-        self._safe_joint6 = self._desired_joint6
-        self._safe_joint7 = self._desired_joint7
+        self._safe_wrist[:] = self._desired_wrist
 
         # Detect whether the user is actively commanding motion
         self._is_commanding_motion = self._any_motion_key_pressed()
@@ -273,7 +292,7 @@ class FrankaKeyboardController:
         should_revert = False
 
         try:
-            measured_efforts = self._robot.get_measured_joint_efforts(joint_indices=_ARM_INDICES)
+            measured_efforts = self._robot.get_measured_joint_efforts(joint_indices=self._arm_indices)
             self._max_measured_effort = float(np.max(np.abs(measured_efforts)))
         except Exception:
             self._max_measured_effort = 0.0
@@ -283,7 +302,7 @@ class FrankaKeyboardController:
         if self._max_measured_effort > self._config.effort_spike_threshold:
             if not self._is_blocked:
                 carb.log_warn(
-                    f"[FrankaKeyboardController] Effort spike detected "
+                    f"[ManipulatorKeyboardController] Effort spike detected "
                     f"({self._max_measured_effort:.1f} N*m > {self._config.effort_spike_threshold} N*m). "
                     "Reverting to safe position."
                 )
@@ -292,7 +311,7 @@ class FrankaKeyboardController:
 
         # Stall detection -- joints are stationary despite active commands
         try:
-            joint_velocities = self._robot.get_joint_velocities(joint_indices=_ARM_INDICES)
+            joint_velocities = self._robot.get_joint_velocities(joint_indices=self._arm_indices)
             max_velocity = float(np.max(np.abs(joint_velocities)))
         except Exception:
             max_velocity = 1.0
@@ -305,7 +324,7 @@ class FrankaKeyboardController:
         if self._stall_frame_count >= self._config.stall_frames_before_blocked:
             if not self._is_blocked:
                 carb.log_warn(
-                    "[FrankaKeyboardController] Motion stall detected -- arm joints "
+                    "[ManipulatorKeyboardController] Motion stall detected -- arm joints "
                     "are stationary despite active commands. Reverting target."
                 )
             self._is_blocked = True
@@ -315,8 +334,7 @@ class FrankaKeyboardController:
 
     def _revert_to_safe_state(self) -> None:
         self._ee_target[:] = self._safe_ee_target
-        self._desired_joint6 = self._safe_joint6
-        self._desired_joint7 = self._safe_joint7
+        self._desired_wrist[:] = self._safe_wrist
 
     def _any_motion_key_pressed(self) -> bool:
         driver = self._keyboard_driver
@@ -336,23 +354,25 @@ class FrankaKeyboardController:
     # ------------------------------------------------------------------
 
     def _init_rmpflow(self) -> bool:
+        p = self._profile
         try:
             rmp_config = mg.interface_config_loader.load_supported_motion_policy_config(
-                self._robot_name, self._policy_name
+                p.robot_name, p.policy_name
             )
             self._rmpflow = mg.lula.motion_policies.RmpFlow(**rmp_config)
             art_policy = mg.ArticulationMotionPolicy(
                 self._robot, self._rmpflow, self._config.physics_dt
             )
             self._controller = mg.MotionPolicyController(
-                name="FrankaRMPflow", articulation_motion_policy=art_policy
+                name=f"{p.robot_name}_{p.policy_name}", articulation_motion_policy=art_policy
             )
             return True
         except Exception as exc:
-            carb.log_error(f"[FrankaKeyboardController] RMPflow config failed: {exc}")
+            carb.log_error(f"[ManipulatorKeyboardController] RMPflow config failed: {exc}")
             return False
 
     def _init_robot_state(self) -> None:
+        p = self._profile
         base_pos, base_rot = self._robot.get_world_pose()
         self._robot_base_position = np.array(base_pos, dtype=np.float64)
 
@@ -361,30 +381,31 @@ class FrankaKeyboardController:
         # Seed EE target from current end-effector position via forward kinematics
         # get_end_effector_pose returns world-frame position (relative to USD stage origin)
         joint_positions = self._robot.get_joint_positions()
-        active_joints = joint_positions[:_ARM_DOF_COUNT]
+        active_joints = joint_positions[:p.arm_dof_count]
         ee_pos, _ = self._rmpflow.get_end_effector_pose(active_joints)
         self._ee_target = np.array(ee_pos, dtype=np.float64)
 
-        self._desired_joint6 = float(joint_positions[5])
-        self._desired_joint7 = float(joint_positions[6])
+        wi = p.wrist_joint_indices
+        self._desired_wrist[0] = float(joint_positions[wi[0]])
+        self._desired_wrist[1] = float(joint_positions[wi[1]])
 
         self._safe_ee_target = self._ee_target.copy()
-        self._safe_joint6 = self._desired_joint6
-        self._safe_joint7 = self._desired_joint7
+        self._safe_wrist[:] = self._desired_wrist
 
     def _resolve_finger_joint_indices(self) -> None:
+        p = self._profile
         dof_names = self._robot.dof_names
         indices = []
-        for finger_name in _FINGER_JOINT_NAMES:
+        for finger_name in p.finger_joint_names:
             for idx, name in enumerate(dof_names):
                 if name == finger_name:
                     indices.append(idx)
                     break
-        if len(indices) == 2:
+        if len(indices) == len(p.finger_joint_names):
             self._finger_joint_indices = np.array(indices, dtype=np.int32)
         else:
             carb.log_warn(
-                f"[FrankaKeyboardController] Could not resolve finger joints {_FINGER_JOINT_NAMES} "
+                f"[ManipulatorKeyboardController] Could not resolve finger joints {p.finger_joint_names} "
                 f"in DOF names {dof_names}. Gripper control disabled."
             )
             self._finger_joint_indices = None
@@ -422,8 +443,8 @@ class FrankaKeyboardController:
     def _clamp_target_to_reach(self, target: np.ndarray) -> np.ndarray:
         offset = target - self._robot_base_position
         distance = np.linalg.norm(offset)
-        if distance > _MAX_CLAMPED_REACH:
-            return self._robot_base_position + (offset / distance) * _MAX_CLAMPED_REACH
+        if distance > self._max_clamped_reach:
+            return self._robot_base_position + (offset / distance) * self._max_clamped_reach
         return target
 
     def _apply_rmpflow(self, target_position: np.ndarray) -> None:
@@ -431,39 +452,42 @@ class FrankaKeyboardController:
             action = self._controller.forward(target_position, None)
             self._robot.apply_action(action)
         except Exception as exc:
-            carb.log_error(f"[FrankaKeyboardController] RMPflow action failed: {exc}")
+            carb.log_error(f"[ManipulatorKeyboardController] RMPflow action failed: {exc}")
 
     def _apply_wrist_overrides(self) -> None:
+        p = self._profile
         driver = self._keyboard_driver
         speed = self._config.wrist_joint_speed_rad
 
-        j7_delta = 0.0
+        # wrist_joint_indices[1] — wrist rotation (Z/X keys)
+        j1_delta = 0.0
         if driver.is_pressed("wrist_rotate_positive"):
-            j7_delta += speed
+            j1_delta += speed
         if driver.is_pressed("wrist_rotate_negative"):
-            j7_delta -= speed
+            j1_delta -= speed
 
-        j6_delta = 0.0
+        # wrist_joint_indices[0] — forearm twist (C/V keys)
+        j0_delta = 0.0
         if driver.is_pressed("forearm_twist_positive"):
-            j6_delta += speed
+            j0_delta += speed
         if driver.is_pressed("forearm_twist_negative"):
-            j6_delta -= speed
+            j0_delta -= speed
 
-        if j6_delta == 0.0 and j7_delta == 0.0:
+        if j0_delta == 0.0 and j1_delta == 0.0:
             return
 
-        self._desired_joint6 = float(np.clip(
-            self._desired_joint6 + j6_delta, _JOINT6_LOWER, _JOINT6_UPPER
+        self._desired_wrist[0] = float(np.clip(
+            self._desired_wrist[0] + j0_delta, p.wrist_joint_lower[0], p.wrist_joint_upper[0]
         ))
-        self._desired_joint7 = float(np.clip(
-            self._desired_joint7 + j7_delta, _JOINT7_LOWER, _JOINT7_UPPER
+        self._desired_wrist[1] = float(np.clip(
+            self._desired_wrist[1] + j1_delta, p.wrist_joint_lower[1], p.wrist_joint_upper[1]
         ))
 
-        self._wrist_positions_buf[0] = self._desired_joint6
-        self._wrist_positions_buf[1] = self._desired_joint7
+        self._wrist_positions_buf[0] = self._desired_wrist[0]
+        self._wrist_positions_buf[1] = self._desired_wrist[1]
         wrist_action = ArticulationAction(
             joint_positions=self._wrist_positions_buf,
-            joint_indices=_WRIST_INDICES,
+            joint_indices=self._wrist_indices,
         )
         self._robot.apply_action(wrist_action)
 
@@ -475,11 +499,11 @@ class FrankaKeyboardController:
             self._gripper_open = not self._gripper_open
             self._gripper_at_target = False
 
-        # Skip joint read if gripper already at target
         if self._gripper_at_target:
             return
 
-        target_pos = _FINGER_OPEN_POSITION if self._gripper_open else _FINGER_CLOSED_POSITION
+        p = self._profile
+        target_pos = p.finger_open_position if self._gripper_open else p.finger_closed_position
         current_positions = self._robot.get_joint_positions(joint_indices=self._finger_joint_indices)
         current_finger = float(current_positions[0])
 
@@ -491,10 +515,13 @@ class FrankaKeyboardController:
         step = np.sign(diff) * min(abs(diff), self._config.gripper_speed * self._config.physics_dt)
         new_pos = current_finger + step
 
-        self._gripper_positions_buf[0] = new_pos
-        self._gripper_positions_buf[1] = new_pos
+        self._gripper_positions_buf[:] = new_pos
         gripper_action = ArticulationAction(
             joint_positions=self._gripper_positions_buf,
             joint_indices=self._finger_joint_indices,
         )
         self._robot.apply_action(gripper_action)
+
+
+# Backwards-compatible alias
+FrankaKeyboardController = ManipulatorKeyboardController
