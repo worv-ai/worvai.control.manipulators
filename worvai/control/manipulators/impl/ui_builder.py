@@ -273,6 +273,8 @@ class ManipulatorUIBuilder:
     def _on_update(self, event) -> None:
         if self._controller is None or not self._controller.is_initialized:
             return
+        if not omni.timeline.get_timeline_interface().is_playing():
+            return
 
         # Physics step
         self._controller.step()
