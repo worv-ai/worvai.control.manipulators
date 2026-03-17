@@ -120,6 +120,7 @@ class ManipulatorKeyboardController:
         self._robot_base_position = np.zeros(3, dtype=np.float64)
         self._desired_wrist = np.zeros(2, dtype=np.float64)  # [joint_a, joint_b]
         self._safe_wrist = np.zeros(2, dtype=np.float64)
+        self._wrist_active: bool = False
         self._gripper_open: bool = True
         self._gripper_at_target: bool = True
         self._finger_joint_indices: Optional[np.ndarray] = None
@@ -457,7 +458,12 @@ class ManipulatorKeyboardController:
         return target
 
     def _update_wrist_from_keyboard(self) -> None:
-        """Update desired wrist angles from keyboard input. Does not apply to robot."""
+        """
+        Update desired wrist angles from keyboard input.
+
+        Sets ``_wrist_active`` so the RMPflow step knows whether to override
+        wrist joints or let RMPflow control them freely.
+        """
         p = self._profile
         driver = self._keyboard_driver
         speed = self._config.wrist_joint_speed_rad
@@ -474,7 +480,15 @@ class ManipulatorKeyboardController:
         if driver.is_pressed("forearm_twist_negative"):
             j0_delta -= speed
 
-        if j0_delta == 0.0 and j1_delta == 0.0:
+        self._wrist_active = j0_delta != 0.0 or j1_delta != 0.0
+
+        if not self._wrist_active:
+            # Sync desired wrist from actual joint positions so the next
+            # keypress starts from wherever RMPflow has placed them
+            wi = p.wrist_joint_indices
+            joint_positions = self._robot.get_joint_positions(joint_indices=self._wrist_indices)
+            self._desired_wrist[0] = float(joint_positions[0])
+            self._desired_wrist[1] = float(joint_positions[1])
             return
 
         self._desired_wrist[0] = float(np.clip(
@@ -486,24 +500,26 @@ class ManipulatorKeyboardController:
 
     def _apply_rmpflow_with_wrist(self, target_position: np.ndarray) -> None:
         """
-        Compute RMPflow action, override wrist joints with desired values, and apply once.
+        Compute RMPflow action and apply it.
 
-        Sets a cspace target on RMPflow so it cooperates with the desired wrist configuration
-        instead of fighting it. The wrist joint positions in the RMPflow output are replaced
-        with the user-commanded values before being sent to the robot.
+        When wrist keys are active: sets a cspace target so RMPflow cooperates,
+        then overrides wrist joint positions in the output before applying.
+        When wrist keys are idle: lets RMPflow control all joints freely.
         """
         try:
-            # Tell RMPflow our preferred joint configuration for null-space resolution
-            cspace_target = self._robot.get_joint_positions(joint_indices=self._arm_indices).copy()
             wi = self._profile.wrist_joint_indices
-            cspace_target[wi[0]] = self._desired_wrist[0]
-            cspace_target[wi[1]] = self._desired_wrist[1]
-            self._rmpflow.set_cspace_target(cspace_target)
+
+            if self._wrist_active:
+                # Guide RMPflow's null-space towards our desired wrist config
+                cspace_target = self._robot.get_joint_positions(joint_indices=self._arm_indices).copy()
+                cspace_target[wi[0]] = self._desired_wrist[0]
+                cspace_target[wi[1]] = self._desired_wrist[1]
+                self._rmpflow.set_cspace_target(cspace_target)
 
             action = self._controller.forward(target_position, None)
 
-            # Override wrist joints in the action with our desired values
-            if action.joint_positions is not None:
+            if self._wrist_active and action.joint_positions is not None:
+                # Override wrist joints with user-commanded values
                 positions = np.array(action.joint_positions, dtype=np.float64)
                 positions[wi[0]] = self._desired_wrist[0]
                 positions[wi[1]] = self._desired_wrist[1]
