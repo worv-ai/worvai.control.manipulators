@@ -246,9 +246,9 @@ class ManipulatorKeyboardController:
         # Apply new commands
         self._ee_target.flags.writeable = True
         self._update_ee_target_from_keyboard()
+        self._update_wrist_from_keyboard()
         clamped_target = self._clamp_target_to_reach(self._ee_target)
-        self._apply_rmpflow(clamped_target)
-        self._apply_wrist_overrides()
+        self._apply_rmpflow_with_wrist(clamped_target)
         self._apply_gripper()
 
     def reset(self) -> None:
@@ -456,26 +456,18 @@ class ManipulatorKeyboardController:
             return self._robot_base_position + (offset / distance) * self._max_clamped_reach
         return target
 
-    def _apply_rmpflow(self, target_position: np.ndarray) -> None:
-        try:
-            action = self._controller.forward(target_position, None)
-            self._robot.apply_action(action)
-        except Exception as exc:
-            carb.log_error(f"[ManipulatorKeyboardController] RMPflow action failed: {exc}")
-
-    def _apply_wrist_overrides(self) -> None:
+    def _update_wrist_from_keyboard(self) -> None:
+        """Update desired wrist angles from keyboard input. Does not apply to robot."""
         p = self._profile
         driver = self._keyboard_driver
         speed = self._config.wrist_joint_speed_rad
 
-        # wrist_joint_indices[1] — wrist rotation (Z/X keys)
         j1_delta = 0.0
         if driver.is_pressed("wrist_rotate_positive"):
             j1_delta += speed
         if driver.is_pressed("wrist_rotate_negative"):
             j1_delta -= speed
 
-        # wrist_joint_indices[0] — forearm twist (C/V keys)
         j0_delta = 0.0
         if driver.is_pressed("forearm_twist_positive"):
             j0_delta += speed
@@ -492,13 +484,34 @@ class ManipulatorKeyboardController:
             self._desired_wrist[1] + j1_delta, p.wrist_joint_lower[1], p.wrist_joint_upper[1]
         ))
 
-        self._wrist_positions_buf[0] = self._desired_wrist[0]
-        self._wrist_positions_buf[1] = self._desired_wrist[1]
-        wrist_action = ArticulationAction(
-            joint_positions=self._wrist_positions_buf,
-            joint_indices=self._wrist_indices,
-        )
-        self._robot.apply_action(wrist_action)
+    def _apply_rmpflow_with_wrist(self, target_position: np.ndarray) -> None:
+        """
+        Compute RMPflow action, override wrist joints with desired values, and apply once.
+
+        Sets a cspace target on RMPflow so it cooperates with the desired wrist configuration
+        instead of fighting it. The wrist joint positions in the RMPflow output are replaced
+        with the user-commanded values before being sent to the robot.
+        """
+        try:
+            # Tell RMPflow our preferred joint configuration for null-space resolution
+            cspace_target = self._robot.get_joint_positions(joint_indices=self._arm_indices).copy()
+            wi = self._profile.wrist_joint_indices
+            cspace_target[wi[0]] = self._desired_wrist[0]
+            cspace_target[wi[1]] = self._desired_wrist[1]
+            self._rmpflow.set_cspace_target(cspace_target)
+
+            action = self._controller.forward(target_position, None)
+
+            # Override wrist joints in the action with our desired values
+            if action.joint_positions is not None:
+                positions = np.array(action.joint_positions, dtype=np.float64)
+                positions[wi[0]] = self._desired_wrist[0]
+                positions[wi[1]] = self._desired_wrist[1]
+                action.joint_positions = positions
+
+            self._robot.apply_action(action)
+        except Exception as exc:
+            carb.log_error(f"[ManipulatorKeyboardController] RMPflow action failed: {exc}")
 
     def _apply_gripper(self) -> None:
         if self._finger_joint_indices is None:
