@@ -247,7 +247,13 @@ class ManipulatorKeyboardController:
             self._ee_target.flags.writeable = True
             self._ee_target[:] = self._initial_ee_target
             if self._initial_joint_positions is not None:
+                # Set positions and zero out velocities to fully stop motion
                 self._robot.set_joint_positions(self._initial_joint_positions)
+                self._robot.set_joint_velocities(np.zeros_like(self._initial_joint_positions))
+                # Apply initial positions as drive targets so controllers don't fight
+                self._robot.apply_action(ArticulationAction(
+                    joint_positions=self._initial_joint_positions,
+                ))
                 wi = self._profile.wrist_joint_indices
                 self._desired_wrist[0] = float(self._initial_joint_positions[wi[0]])
                 self._desired_wrist[1] = float(self._initial_joint_positions[wi[1]])
@@ -257,6 +263,9 @@ class ManipulatorKeyboardController:
             self._stall_frame_count = 0
             if self._rmpflow is not None:
                 self._rmpflow.reset()
+                # Re-seed RMPflow with the reset base pose
+                base_pos, base_rot = self._robot.get_world_pose()
+                self._rmpflow.set_robot_base_pose(base_pos, base_rot)
             return
 
         # Snapshot safe state before applying new commands
