@@ -121,6 +121,7 @@ class ManipulatorKeyboardController:
         self._desired_wrist = np.zeros(2, dtype=np.float64)  # [joint_a, joint_b]
         self._safe_wrist = np.zeros(2, dtype=np.float64)
         self._initial_ee_target = np.zeros(3, dtype=np.float64)
+        self._initial_joint_positions: Optional[np.ndarray] = None
         self._wrist_active: bool = False
         self._gripper_open: bool = True
         self._gripper_at_target: bool = True
@@ -241,10 +242,22 @@ class ManipulatorKeyboardController:
             if self._is_blocked:
                 self._is_blocked = False
 
-        # Reset EE target to initial position on R key (single-shot)
+        # Reset to initial state on R key
         if self._keyboard_driver.is_pressed("reset_target"):
             self._ee_target.flags.writeable = True
             self._ee_target[:] = self._initial_ee_target
+            if self._initial_joint_positions is not None:
+                self._robot.set_joint_positions(self._initial_joint_positions)
+                wi = self._profile.wrist_joint_indices
+                self._desired_wrist[0] = float(self._initial_joint_positions[wi[0]])
+                self._desired_wrist[1] = float(self._initial_joint_positions[wi[1]])
+            self._gripper_open = True
+            self._gripper_at_target = False
+            self._is_blocked = False
+            self._stall_frame_count = 0
+            if self._rmpflow is not None:
+                self._rmpflow.reset()
+            return
 
         # Snapshot safe state before applying new commands
         self._safe_ee_target[:] = self._ee_target
@@ -402,6 +415,7 @@ class ManipulatorKeyboardController:
         # Seed EE target from current end-effector position via forward kinematics
         # get_end_effector_pose returns world-frame position (relative to USD stage origin)
         joint_positions = self._robot.get_joint_positions()
+        self._initial_joint_positions = joint_positions.copy()
         active_joints = joint_positions[:p.arm_dof_count]
         ee_pos, _ = self._rmpflow.get_end_effector_pose(active_joints)
         self._ee_target[:] = ee_pos  # in-place to preserve array identity
