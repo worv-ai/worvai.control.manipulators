@@ -1,0 +1,23 @@
+[package]
+title = "Manipulator Control"
+description = "Keyboard-driven manipulator control with GUI panel using RMPflow. WASD/QE end-effector positioning, arrow key alternatives, ZXCV wrist joint overrides, K gripper toggle, collision-aware safety, and optional EE target visualizer."
+category = "robotics"
+version = "0.1.0"
+authors = ["khemoo"]
+readme = "docs/README.md"
+repository = "https://github.com/worv-ai/worvai.control.manipulators"
+keywords = ["isaac", "robot", "manipulator", "rmpflow", "keyboard", "control", "gripper"]
+writeTarget.kit = true
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.kit.menu.utils" = {}
+"omni.ui" = {}
+"omni.timeline" = {}
+"omni.usd" = {}
+"isaacsim.core.api" = {}
+"isaacsim.robot_motion.motion_generation" = {}
+"isaacsim.robot.manipulators" = {}
+
+[[python.module]]
+name = "worvai.control.manipulators"
