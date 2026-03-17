@@ -218,21 +218,34 @@ class ManipulatorUIBuilder:
             self._try_initialize()
         elif event.type == int(omni.timeline.TimelineEventType.STOP):
             self._detach_update()
+            # Do NOT call reset() here — physics view is already destroyed.
+            # Mark controller for re-initialization on next PLAY.
             if self._controller is not None:
-                self._controller.reset()
+                self._controller.shutdown()
+                self._controller = None
             if self._visualizer is not None:
                 self._visualizer.destroy()
             self._set_status("Stopped (press Play)", ok=True)
 
     def _try_initialize(self) -> None:
+        # Re-create controller if it was shut down on STOP
         if self._controller is None:
-            return
+            prim_path = self._prim_path_model.get_value_as_string().strip()
+            if not prim_path:
+                self._set_status("Set prim path first", ok=False)
+                return
+            config = ManipulatorControlConfig(
+                ee_step_size_m=self._ee_speed_model.get_value_as_float(),
+                wrist_joint_speed_rad=self._wrist_speed_model.get_value_as_float(),
+                gripper_speed=self._gripper_speed_model.get_value_as_float(),
+                effort_spike_threshold=self._effort_threshold_model.get_value_as_float(),
+            )
+            self._controller = ManipulatorKeyboardController(robot_prim_path=prim_path, config=config)
+
         if not self._controller.is_initialized:
             if not self._controller.initialize():
                 self._set_status("Init failed -- check console", ok=False)
                 return
-        else:
-            self._controller.reset()
 
         self._ensure_visualizer()
         self._attach_update()

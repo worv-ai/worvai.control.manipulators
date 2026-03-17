@@ -255,11 +255,18 @@ class ManipulatorKeyboardController:
     def reset(self) -> None:
         """
         Re-read the robot base pose and reset the EE target to current end-effector position.
+        Safe to call even when physics is not ready — guards against None joint positions.
         """
         if self._robot is None or self._controller is None:
             return
-        self._ee_target.flags.writeable = True
-        self._init_robot_state()
+        if not self._robot.handles_initialized:
+            return
+        try:
+            self._ee_target.flags.writeable = True
+            self._init_robot_state()
+        except Exception as exc:
+            carb.log_warn(f"[ManipulatorKeyboardController] Reset deferred — physics not ready: {exc}")
+            return
         if self._rmpflow is not None:
             self._rmpflow.reset()
         self._gripper_open = True
