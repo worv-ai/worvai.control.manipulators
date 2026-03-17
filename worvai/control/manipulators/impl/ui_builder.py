@@ -114,11 +114,12 @@ class ManipulatorUIBuilder:
         bindings = [
             ("W / S", "Move EE forward / backward"),
             ("A / D", "Move EE left / right"),
-            ("Q / E", "Move EE up / down"),
+            ("E / Q", "Move EE up / down"),
             ("Arrows", "Alt forward / back / left / right"),
             ("Z / X", "Rotate wrist (joint 7)"),
             ("C / V", "Twist forearm (joint 6)"),
             ("K", "Toggle gripper open / close"),
+            ("R", "Reset EE target to initial position"),
         ]
         with ui.VStack(spacing=2):
             for key, desc in bindings:

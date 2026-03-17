@@ -16,13 +16,13 @@ class ManipulatorKeyBindings:
     Each field maps a logical action to a ``carb.input.KeyboardInput`` constant.
     """
 
-    # End-effector translation (WASD + QE for vertical)
+    # End-effector translation (WASD + EQ for vertical)
     move_forward: int = carb.input.KeyboardInput.W
     move_backward: int = carb.input.KeyboardInput.S
     move_left: int = carb.input.KeyboardInput.A
     move_right: int = carb.input.KeyboardInput.D
-    move_up: int = carb.input.KeyboardInput.Q
-    move_down: int = carb.input.KeyboardInput.E
+    move_up: int = carb.input.KeyboardInput.E
+    move_down: int = carb.input.KeyboardInput.Q
 
     # Arrow key aliases for EE translation
     move_forward_alt: int = carb.input.KeyboardInput.UP
@@ -38,6 +38,9 @@ class ManipulatorKeyBindings:
 
     # Gripper toggle
     gripper_toggle: int = carb.input.KeyboardInput.K
+
+    # Reset EE target to initial position
+    reset_target: int = carb.input.KeyboardInput.R
 
 
 @dataclass
@@ -73,7 +76,7 @@ class ManipulatorKeyboardDriver:
             "move_forward_alt", "move_backward_alt", "move_left_alt", "move_right_alt",
             "wrist_rotate_positive", "wrist_rotate_negative",
             "forearm_twist_positive", "forearm_twist_negative",
-            "gripper_toggle",
+            "gripper_toggle", "reset_target",
         ):
             key_constant = getattr(self._bindings, action_name)
             state = _KeyState(key=key_constant)

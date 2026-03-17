@@ -120,6 +120,7 @@ class ManipulatorKeyboardController:
         self._robot_base_position = np.zeros(3, dtype=np.float64)
         self._desired_wrist = np.zeros(2, dtype=np.float64)  # [joint_a, joint_b]
         self._safe_wrist = np.zeros(2, dtype=np.float64)
+        self._initial_ee_target = np.zeros(3, dtype=np.float64)
         self._wrist_active: bool = False
         self._gripper_open: bool = True
         self._gripper_at_target: bool = True
@@ -239,6 +240,11 @@ class ManipulatorKeyboardController:
             self._stall_frame_count = 0
             if self._is_blocked:
                 self._is_blocked = False
+
+        # Reset EE target to initial position on R key (single-shot)
+        if self._keyboard_driver.is_pressed("reset_target"):
+            self._ee_target.flags.writeable = True
+            self._ee_target[:] = self._initial_ee_target
 
         # Snapshot safe state before applying new commands
         self._safe_ee_target[:] = self._ee_target
@@ -399,6 +405,7 @@ class ManipulatorKeyboardController:
         active_joints = joint_positions[:p.arm_dof_count]
         ee_pos, _ = self._rmpflow.get_end_effector_pose(active_joints)
         self._ee_target[:] = ee_pos  # in-place to preserve array identity
+        self._initial_ee_target[:] = ee_pos
 
         wi = p.wrist_joint_indices
         self._desired_wrist[0] = float(joint_positions[wi[0]])
